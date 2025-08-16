@@ -1,0 +1,343 @@
+# docker-compose.yml - RepoForge Containerized Development Environment
+# Complete setup for running RepoForge in Docker containers
+
+version: '3.8'
+
+services:
+  # Main RepoForge CLI service
+  repoforge:
+    image: repoforge/cli:latest
+    container_name: repoforge-cli
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "20"
+        REPOFORGE_VERSION: "latest"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - REPOFORGE_HOME=/home/repoforge/.repoforge
+      - NODE_ENV=production
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - STANDARDS_REPO=https://github.com/williamzujkowski/standards.git
+    volumes:
+      # Mount current directory as workspace
+      - ./workspace:/workspace
+      # Persist RepoForge configuration
+      - repoforge-config:/home/repoforge/.repoforge
+      # Persist npm cache for faster builds
+      - npm-cache:/home/repoforge/.npm
+      # Mount Docker socket for container operations
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount SSH keys for Git operations
+      - ~/.ssh:/home/repoforge/.ssh:ro
+      # Mount Git config
+      - ~/.gitconfig:/home/repoforge/.gitconfig:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD", "repoforge", "doctor", "--quiet"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    command: /bin/bash
+
+  # Claude API proxy service (optional - for rate limiting and caching)
+  claude-proxy:
+    image: repoforge/claude-proxy:latest
+    container_name: claude-proxy
+    build:
+      context: ./claude-proxy
+      dockerfile: Dockerfile
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - REDIS_URL=redis://redis:6379
+      - RATE_LIMIT_PER_MINUTE=60
+      - CACHE_TTL=3600
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Redis cache for Claude responses
+  redis:
+    image: redis:7-alpine
+    container_name: repoforge-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - repoforge-network
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # PostgreSQL database for project metadata
+  postgres:
+    image: postgres:15-alpine
+    container_name: repoforge-postgres
+    environment:
+      - POSTGRES_DB=repoforge
+      - POSTGRES_USER=repoforge
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-repoforge123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repoforge"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Web UI for RepoForge (optional)
+  web-ui:
+    image: repoforge/web-ui:latest
+    container_name: repoforge-ui
+    build:
+      context: ./web-ui
+      dockerfile: Dockerfile
+    environment:
+      - API_URL=http://api:3000
+      - PUBLIC_URL=http://localhost:3001
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # API service for RepoForge
+  api:
+    image: repoforge/api:latest
+    container_name: repoforge-api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://repoforge:${POSTGRES_PASSWORD:-repoforge123}@postgres:5432/repoforge
+      - REDIS_URL=redis://redis:6379
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key}
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: repoforge-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - repoforge-network
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: repoforge-grafana
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - repoforge-network
+    restart: unless-stopped
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: repoforge-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - web-ui
+      - api
+      - grafana
+    networks:
+      - repoforge-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Standards repository syncer (runs periodically)
+  standards-syncer:
+    image: alpine/git:latest
+    container_name: repoforge-standards-syncer
+    volumes:
+      - standards-repo:/standards
+    networks:
+      - repoforge-network
+    entrypoint: |
+      sh -c '
+        while true; do
+          if [ ! -d "/standards/.git" ]; then
+            git clone https://github.com/williamzujkowski/standards.git /standards
+          else
+            cd /standards && git pull origin master
+          fi
+          sleep 3600
+        done
+      '
+    restart: unless-stopped
+
+  # Development container with all tools pre-installed
+  dev-environment:
+    image: repoforge/dev-environment:latest
+    container_name: repoforge-dev
+    build:
+      context: ./dev-environment
+      dockerfile: Dockerfile
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ./workspace:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ~/.ssh:/home/developer/.ssh:ro
+      - ~/.gitconfig:/home/developer/.gitconfig:ro
+      - vscode-extensions:/home/developer/.vscode-server/extensions
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    networks:
+      - repoforge-network
+    command: /bin/zsh
+    profiles:
+      - development
+
+# Networks
+networks:
+  repoforge-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# Volumes for data persistence
+volumes:
+  repoforge-config:
+    driver: local
+  npm-cache:
+    driver: local
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  standards-repo:
+    driver: local
+  vscode-extensions:
+    driver: local
+
+# Dockerfile for main RepoForge service
+# Save as Dockerfile in the same directory
+---
+# FROM node:20-alpine AS builder
+# 
+# # Install system dependencies
+# RUN apk add --no-cache git python3 make g++ bash
+# 
+# # Create repoforge user
+# RUN addgroup -g 1001 -S repoforge && \
+#     adduser -S repoforge -u 1001 -G repoforge
+# 
+# # Set working directory
+# WORKDIR /app
+# 
+# # Install RepoForge CLI
+# RUN npm install -g repoforge-cli@latest
+# 
+# # Install additional tools
+# RUN npm install -g \
+#     @anthropic-ai/claude-cli \
+#     prettier \
+#     eslint \
+#     typescript \
+#     nodemon \
+#     concurrently
+# 
+# # Switch to repoforge user
+# USER repoforge
+# 
+# # Create necessary directories
+# RUN mkdir -p /home/repoforge/.repoforge/{config,templates,cache,logs,standards}
+# 
+# # Copy configuration
+# COPY --chown=repoforge:repoforge config/ /home/repoforge/.repoforge/config/
+# 
+# # Set environment
+# ENV PATH="/app/node_modules/.bin:$PATH"
+# ENV REPOFORGE_HOME="/home/repoforge/.repoforge"
+# 
+# # Health check
+# HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+#   CMD repoforge doctor --quiet || exit 1
+# 
+# # Default command
+# CMD ["/bin/bash"]
