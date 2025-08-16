@@ -450,13 +450,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - [Anthropic](https://anthropic.com) for Claude AI
 - The open-source community for amazing frameworks and tools
 
-## 📞 **Support**
-
-- 📧 Email: support@example.com
-- 💬 Discord: [Join our server](https://discord.gg/example)
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/template-generator/issues)
-- 📚 Wiki: [GitHub Wiki](https://github.com/yourusername/template-generator/wiki)
-
 ---
 
 **Built with ❤️ by developers, for developers**
